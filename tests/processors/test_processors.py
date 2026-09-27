@@ -21,7 +21,13 @@ import pytest
 import structlog
 
 from structlog import BoundLogger
+from structlog._config import BoundLoggerLazyProxy
 from structlog._utils import get_processname
+from structlog.contextvars import (
+    bind_contextvars,
+    clear_contextvars,
+    merge_contextvars,
+)
 from structlog.processors import (
     CallsiteParameter,
     CallsiteParameterAdder,
@@ -29,14 +35,16 @@ from structlog.processors import (
     ExceptionPrettyPrinter,
     JSONRenderer,
     StackInfoRenderer,
+    TimeStamper,
     UnicodeDecoder,
     UnicodeEncoder,
     _figure_out_exc_info,
+    add_log_level,
     format_exc_info,
 )
 from structlog.stdlib import ProcessorFormatter
 from structlog.testing import CapturingLoggerFactory
-from structlog.typing import EventDict, ExcInfo
+from structlog.typing import BindableLogger, EventDict, ExcInfo
 
 from ..additional_frame import additional_frame
 
@@ -762,3 +770,247 @@ class TestRenameKey:
         assert {"msg": "hi", "foo": "bar"} == EventRenamer("msg", "missing")(
             None, None, {"event": "hi", "foo": "bar"}
         )
+
+
+class TestProcessorChainSemantics:
+    """
+    Pin down how the processor chain turns a log call into the final
+    record, using the chain we run in production: merge_contextvars,
+    add_log_level, TimeStamper, JSONRenderer.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_contextvars(self):
+        """
+        Make sure all tests start with a clean context-local slate.
+        """
+        clear_contextvars()
+
+    @pytest.fixture(name="clf")
+    def _clf(self):
+        """
+        A CapturingLoggerFactory wired into structlog's configuration.
+        """
+        clf = CapturingLoggerFactory()
+        structlog.configure(
+            logger_factory=clf,
+            cache_logger_on_first_use=False,
+        )
+        return clf
+
+    def test_processors_run_in_order_feeding_each_other(self, clf):
+        """
+        Processors run in list order; each one receives the previous
+        processor's return value. The event_dict starts as the bound
+        context plus the call kwargs, with "event" added last; the final
+        processor's return value becomes the record passed to the wrapped
+        logger.
+        """
+        seen = []
+
+        def proc1(logger, method_name, event_dict):
+            seen.append(("proc1", dict(event_dict)))
+            event_dict["p1"] = True
+            return event_dict
+
+        def proc2(logger, method_name, event_dict):
+            seen.append(("proc2", dict(event_dict)))
+            return event_dict
+
+        structlog.configure(
+            processors=[proc1, proc2, lambda logger, method, ed: "final"],
+            logger_factory=clf,
+        )
+
+        structlog.get_logger().info("hello", x=1)
+
+        assert ["proc1", "proc2"] == [name for name, _ in seen]
+        # kwargs land before "event"; insertion order is preserved.
+        assert ["x", "event"] == list(seen[0][1])
+        # proc2 sees proc1's mutated dict, not the original.
+        assert {"x": 1, "event": "hello", "p1": True} == seen[1][1]
+
+        # A str from the last processor becomes the single positional
+        # argument of the wrapped logger call.
+        (call,) = clf.logger.calls
+        assert "info" == call.method_name
+        assert ("final",) == call.args
+        assert {} == call.kwargs
+
+    def test_full_chain_produces_expected_record(self, clf):
+        """
+        The production chain merges contextvars, level, and timestamp into
+        one JSON line whose key order is pure insertion order (JSONRenderer
+        does not sort by default): bound context, call kwargs, "event",
+        contextvars, "level", "timestamp".
+        """
+        structlog.configure(
+            processors=[
+                merge_contextvars,
+                add_log_level,
+                TimeStamper(fmt="iso", utc=True),
+                JSONRenderer(),
+            ],
+            logger_factory=clf,
+        )
+        bind_contextvars(request_id="r-1")
+
+        structlog.get_logger(component="api").info("user.login", user_id=42)
+
+        (call,) = clf.logger.calls
+        assert "info" == call.method_name
+        (line,) = call.args
+        record = json.loads(line)
+
+        assert {
+            "component": "api",
+            "user_id": 42,
+            "event": "user.login",
+            "request_id": "r-1",
+            "level": "info",
+            "timestamp": record["timestamp"],
+        } == record
+        assert [
+            "component",
+            "user_id",
+            "event",
+            "request_id",
+            "level",
+            "timestamp",
+        ] == list(record)
+
+    def test_drop_event_silently_drops_record(self, clf):
+        """
+        A processor raising DropEvent aborts the chain: nothing reaches
+        the wrapped logger and no exception propagates to the caller.
+        """
+
+        def dropper(logger, method_name, event_dict):
+            raise structlog.DropEvent
+
+        structlog.configure(processors=[dropper], logger_factory=clf)
+
+        structlog.get_logger().info("gone")
+
+        assert [] == clf.logger.calls
+
+
+class TestLazyProxyContextExpansion:
+    """
+    Pin down when BoundLoggerLazyProxy turns context into the event dict,
+    and that wrap_logger()'s proxy and get_logger()'s proxy expand to the
+    same record.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_contextvars(self):
+        """
+        Make sure all tests start with a clean context-local slate.
+        """
+        clear_contextvars()
+
+    @pytest.fixture(name="clf")
+    def _clf(self):
+        """
+        A CapturingLoggerFactory wired into structlog's configuration with
+        a merge_contextvars-based chain.
+        """
+        clf = CapturingLoggerFactory()
+        structlog.configure(
+            processors=[
+                merge_contextvars,
+                add_log_level,
+                TimeStamper(fmt="iso", utc=True),
+                JSONRenderer(),
+            ],
+            logger_factory=clf,
+            cache_logger_on_first_use=False,
+        )
+        return clf
+
+    def test_get_logger_defers_everything_to_call_time(self, clf):
+        """
+        get_logger() only builds a BoundLoggerLazyProxy: no wrapped logger
+        is created and no context is captured yet. contextvars bound
+        *after* get_logger() but *before* the log call still land in the
+        record, because the context is expanded by the processor chain at
+        call time.
+        """
+        proxy = structlog.get_logger()
+
+        assert isinstance(proxy, BoundLoggerLazyProxy)
+        assert proxy._logger is None
+        assert [] == clf.logger.calls
+
+        bind_contextvars(late="bound-after-get-logger")
+        proxy.info("x")
+
+        (call,) = clf.logger.calls
+        record = json.loads(call.args[0])
+        assert "bound-after-get-logger" == record["late"]
+
+    def test_each_call_reexpands_context_without_caching(self, clf):
+        """
+        With the default cache_logger_on_first_use=False, every log call
+        assembles a fresh bound logger, so contextvars bound between two
+        calls show up only from that point on.
+        """
+        log = structlog.get_logger()
+
+        log.info("first")
+        bind_contextvars(phase=2)
+        log.info("second")
+
+        first, second = (
+            json.loads(call.args[0]) for call in clf.logger.calls
+        )
+        assert "phase" not in first
+        assert 2 == second["phase"]
+
+    def test_bind_on_proxy_materializes_bound_logger(self, clf):
+        """
+        bind() is the moment the proxy's configuration and initial values
+        materialize into a real BoundLogger; the result is no longer lazy.
+        """
+        proxy = structlog.get_logger()
+
+        bound = proxy.bind(a=1)
+
+        assert not isinstance(bound, BoundLoggerLazyProxy)
+        assert isinstance(bound, BindableLogger)
+        assert {"a": 1} == structlog.get_context(bound)
+
+    def test_wrap_logger_and_get_logger_expand_identically(self, clf):
+        """
+        wrap_logger()'s lazy proxy and get_logger()'s proxy expand to the
+        same record: same keys, same values, same order -- both are
+        BoundLoggerLazyProxy over the same configuration.
+        """
+        bind_contextvars(req="r-1")
+
+        get_logger_proxy = structlog.get_logger(component="api")
+        wrap_logger_proxy = structlog.wrap_logger(None, component="api")
+
+        assert isinstance(get_logger_proxy, BoundLoggerLazyProxy)
+        assert isinstance(wrap_logger_proxy, BoundLoggerLazyProxy)
+
+        get_logger_proxy.info("evt", x=1)
+        wrap_logger_proxy.info("evt", x=1)
+
+        assert 2 == len(clf.logger.calls)
+        first, second = (
+            json.loads(call.args[0]) for call in clf.logger.calls
+        )
+        # The timestamp may legitimately differ between the two calls.
+        first.pop("timestamp")
+        second.pop("timestamp")
+
+        assert first == second
+        assert list(first) == list(second)
+        assert {
+            "component": "api",
+            "x": 1,
+            "event": "evt",
+            "req": "r-1",
+            "level": "info",
+        } == first

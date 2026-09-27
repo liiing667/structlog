@@ -302,3 +302,162 @@ class TestBoundContextvars:
         assert "wrapped" == wrapped.__name__
         assert "(arg1)" == str(inspect.signature(wrapped))
         assert "Wrapped documentation" == wrapped.__doc__
+
+
+class TestAsyncioTaskIsolation:
+    """
+    Pin down how context-local context behaves across asyncio tasks:
+
+    ``asyncio.create_task`` copies the current context at creation time, so
+    binds are task-local and never leak into concurrently running siblings.
+    """
+
+    async def test_sibling_tasks_do_not_leak(self):
+        """
+        Keys bound inside one task are invisible to a concurrently running
+        sibling task, while keys bound in the parent before task creation
+        are visible in both.
+        """
+        bind_contextvars(request_id="req-1")
+
+        async def worker(name):
+            bind_contextvars(worker=name)
+            # Yield so both tasks bind before either merges.
+            await asyncio.sleep(0.01)
+            return merge_contextvars(None, None, {})
+
+        results = await asyncio.gather(
+            asyncio.create_task(worker("one")),
+            asyncio.create_task(worker("two")),
+        )
+
+        assert [
+            {"request_id": "req-1", "worker": "one"},
+            {"request_id": "req-1", "worker": "two"},
+        ] == results
+
+    async def test_bind_after_task_creation_is_invisible(self):
+        """
+        A task sees the context as of its creation: keys bound in the
+        parent *after* create_task do not propagate into the task.
+        """
+
+        async def worker():
+            await asyncio.sleep(0.01)
+            return get_contextvars()
+
+        task = asyncio.create_task(worker())
+        bind_contextvars(late=1)
+
+        assert {} == await task
+
+    async def test_child_binds_do_not_propagate_to_parent(self):
+        """
+        Keys bound inside a task are gone from the parent once the task
+        has finished.
+        """
+
+        async def worker():
+            bind_contextvars(inner=1)
+
+        await asyncio.create_task(worker())
+
+        assert {} == get_contextvars()
+
+
+class TestBindUnbindResetSemantics:
+    """
+    Pin down what nested bind_contextvars / unbind_contextvars /
+    reset_contextvars actually merge.
+    """
+
+    def test_unbind_does_not_restore_outer_value(self):
+        """
+        unbind_contextvars is *not* scoped: after a nested re-bind,
+        unbinding removes the key entirely (an Ellipsis tombstone) instead
+        of restoring the outer value.
+
+        NOTE: a stack-like "unbind restores the previous value" mental
+        model is a misunderstanding on our side, not an implementation
+        defect. Use the tokens returned by bind_contextvars together with
+        reset_contextvars for scope-like restoration.
+        """
+        bind_contextvars(a=1)
+        bind_contextvars(a=2)
+        unbind_contextvars("a")
+
+        assert {} == get_contextvars()
+        assert {"b": 2} == merge_contextvars(None, None, {"b": 2})
+
+    def test_reset_restores_value_from_token_creation_time(self):
+        """
+        reset_contextvars restores each key to the value it had when its
+        token was created -- even if the key was unbound in the meantime.
+
+        Note that the token must come from the *second* bind: a token
+        restores the state from *before its own bind_contextvars call*,
+        not the value that bind installed.
+        """
+        bind_contextvars(a=1)
+        tokens = bind_contextvars(a=2)
+        unbind_contextvars("a")
+
+        reset_contextvars(**tokens)
+
+        assert {"a": 1} == get_contextvars()
+
+    def test_reset_to_absent_removes_key(self):
+        """
+        A token created while the key was unbound resets the key back to
+        "absent" (the Ellipsis tombstone), so it disappears from merges.
+        """
+        tokens = bind_contextvars(a=1)
+
+        assert {"a": 1} == get_contextvars()
+
+        reset_contextvars(**tokens)
+
+        assert {} == get_contextvars()
+
+    def test_reset_only_touches_passed_tokens(self):
+        """
+        reset_contextvars leaves keys without a passed token alone.
+        """
+        bind_contextvars(a=1)
+        tokens = bind_contextvars(a=2)
+        bind_contextvars(b=3)
+
+        reset_contextvars(**tokens)
+
+        assert {"a": 1, "b": 3} == get_contextvars()
+
+    def test_merge_mutates_and_returns_same_dict(self):
+        """
+        merge_contextvars merges into the passed event_dict in place and
+        returns the identical object. The merge is a snapshot: binds that
+        happen afterwards don't affect the returned dict.
+        """
+        bind_contextvars(a=1)
+        event_dict = {"b": 2}
+
+        result = merge_contextvars(None, None, event_dict)
+
+        assert result is event_dict
+        assert {"a": 1, "b": 2} == result
+
+        bind_contextvars(c=3)
+
+        assert {"a": 1, "b": 2} == result
+
+    def test_event_dict_wins_over_context(self):
+        """
+        merge_contextvars uses setdefault: keys already present in the
+        event_dict (e.g. from BoundLogger.bind or log-call kwargs) are
+        *not* overwritten by the context-local context.
+
+        NOTE: the naive guess "bind_contextvars overrides per-call values"
+        is a misunderstanding on our side; the precedence is intentional.
+        """
+        bind_contextvars(a=1)
+
+        assert {"a": 111} == merge_contextvars(None, None, {"a": 111})
