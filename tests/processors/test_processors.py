@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import datetime
 import functools
 import inspect
 import json
@@ -17,11 +19,19 @@ import threading
 from io import StringIO
 
 import pytest
+import time_machine
 
 import structlog
 
 from structlog import BoundLogger
+from structlog._config import BoundLoggerLazyProxy
 from structlog._utils import get_processname
+from structlog.contextvars import (
+    bind_contextvars,
+    bound_contextvars,
+    clear_contextvars,
+    merge_contextvars,
+)
 from structlog.processors import (
     CallsiteParameter,
     CallsiteParameterAdder,
@@ -29,9 +39,11 @@ from structlog.processors import (
     ExceptionPrettyPrinter,
     JSONRenderer,
     StackInfoRenderer,
+    TimeStamper,
     UnicodeDecoder,
     UnicodeEncoder,
     _figure_out_exc_info,
+    add_log_level,
     format_exc_info,
 )
 from structlog.stdlib import ProcessorFormatter
@@ -45,6 +57,259 @@ try:
     import simplejson
 except ImportError:
     simplejson = None
+
+
+@pytest.fixture
+def clean_contextvars():
+    """
+    Ensure contextvars tests don't leak state into neighboring tests.
+    """
+    clear_contextvars()
+    yield
+    clear_contextvars()
+
+
+class TestConfiguredProcessorChain:
+    @time_machine.travel(
+        datetime.datetime(
+            1980, 3, 25, 16, 0, 0, tzinfo=datetime.timezone.utc
+        ),
+        tick=False,
+    )
+    def test_wrap_logger_and_get_logger_expand_to_same_event(
+        self, sio, clean_contextvars
+    ):
+        """
+        wrap_logger and get_logger both return lazy proxies. Once bound and
+        logged, their contexts expand into identical event dictionaries in
+        the same insertion order.
+
+        Expecting get_logger to return a concrete BoundLogger directly is a
+        misunderstanding of the public API, not an implementation defect.
+        """
+        structlog.configure(
+            processors=[
+                merge_contextvars,
+                add_log_level,
+                TimeStamper(fmt="iso"),
+                JSONRenderer(),
+            ],
+            logger_factory=structlog.PrintLoggerFactory(file=sio),
+            wrapper_class=structlog.BoundLogger,
+        )
+
+        with bound_contextvars(
+            service="context-service",
+            request_id="context-request",
+            trace_id="context-trace",
+        ):
+            wrapped_proxy = structlog.wrap_logger(
+                structlog.PrintLogger(file=sio), service="svc"
+            )
+            gotten_proxy = structlog.get_logger(service="svc")
+
+            assert isinstance(wrapped_proxy, BoundLoggerLazyProxy)
+            assert isinstance(gotten_proxy, BoundLoggerLazyProxy)
+
+            wrapped = wrapped_proxy.bind(component="api")
+            gotten = gotten_proxy.bind(component="api")
+
+            assert isinstance(wrapped, structlog.BoundLogger)
+            assert isinstance(gotten, structlog.BoundLogger)
+            assert wrapped._context == gotten._context
+            assert ["service", "component"] == list(wrapped._context)
+
+            wrapped.info("hello", request_id="event-request")
+            gotten.info("hello", request_id="event-request")
+
+        lines = sio.getvalue().splitlines()
+
+        assert 2 == len(lines)
+        assert lines[0] == lines[1]
+
+        record = json.loads(lines[0])
+
+        assert [
+            "service",
+            "component",
+            "request_id",
+            "event",
+            "trace_id",
+            "level",
+            "timestamp",
+        ] == list(record)
+        assert {
+            "service": "svc",
+            "component": "api",
+            "request_id": "event-request",
+            "event": "hello",
+            # Bound logger and event kwargs already occupy these keys, so
+            # merge_contextvars cannot replace them with contextvar values.
+            "trace_id": "context-trace",
+            "level": "info",
+            "timestamp": "1980-03-25T16:00:00Z",
+        } == record
+
+    def test_lazy_proxy_expands_context_when_event_is_processed(
+        self, sio, clean_contextvars
+    ):
+        """
+        BoundLoggerLazyProxy.bind() only assembles a BoundLogger and its
+        context. The context is copied into an event dictionary immediately
+        before the first processor runs, as part of processing a log call.
+        """
+        seen = []
+
+        def inspect_event_dict(logger, method_name, event_dict):
+            seen.append((method_name, event_dict.copy(), list(event_dict)))
+            return event_dict
+
+        structlog.configure(
+            processors=[inspect_event_dict],
+            logger_factory=structlog.PrintLoggerFactory(file=sio),
+            wrapper_class=structlog.BoundLogger,
+        )
+
+        proxy = structlog.wrap_logger(None, service="svc")
+
+        assert isinstance(proxy, BoundLoggerLazyProxy)
+        assert {"service": "svc"} == structlog.get_context(proxy)
+        assert [] == seen
+
+        bound = proxy.bind(component="api")
+
+        assert {"service": "svc", "component": "api"} == bound._context
+        assert [] == seen
+
+        bound.info("hello", request_id="event-request")
+
+        assert [
+            (
+                "info",
+                {
+                    "service": "svc",
+                    "component": "api",
+                    "request_id": "event-request",
+                    "event": "hello",
+                },
+                ["service", "component", "request_id", "event"],
+            )
+        ] == seen
+        assert {"service": "svc", "component": "api"} == bound._context
+
+    @time_machine.travel(
+        datetime.datetime(
+            1980, 3, 25, 16, 0, 0, tzinfo=datetime.timezone.utc
+        ),
+        tick=False,
+    )
+    def test_processors_run_in_order_and_final_return_becomes_record(
+        self, clean_contextvars
+    ):
+        """
+        Processors run in configuration order and each return value becomes
+        the next processor's input. JSONRenderer's string is passed as the
+        sole positional argument to the wrapped logger.
+        """
+        calls = []
+
+        def record_call(name, processor):
+            def recorded(logger, method_name, event_dict):
+                calls.append((name, method_name, list(event_dict)))
+                return processor(logger, method_name, event_dict)
+
+            return recorded
+
+        logger_factory = CapturingLoggerFactory()
+        structlog.configure(
+            processors=[
+                record_call("merge", merge_contextvars),
+                record_call("level", add_log_level),
+                record_call("timestamp", TimeStamper(fmt="iso")),
+                record_call("json", JSONRenderer()),
+            ],
+            logger_factory=logger_factory,
+            wrapper_class=structlog.BoundLogger,
+        )
+
+        with bound_contextvars(trace_id="context-trace"):
+            structlog.get_logger(service="svc").info("hello")
+
+        assert [
+            ("merge", "info", ["service", "event"]),
+            ("level", "info", ["service", "event", "trace_id"]),
+            (
+                "timestamp",
+                "info",
+                ["service", "event", "trace_id", "level"],
+            ),
+            (
+                "json",
+                "info",
+                ["service", "event", "trace_id", "level", "timestamp"],
+            ),
+        ] == calls
+
+        assert 1 == len(logger_factory.logger.calls)
+        captured = logger_factory.logger.calls[0]
+
+        assert "info" == captured.method_name
+        assert 1 == len(captured.args)
+        assert {} == captured.kwargs
+        assert {
+            "service": "svc",
+            "event": "hello",
+            "trace_id": "context-trace",
+            "level": "info",
+            "timestamp": "1980-03-25T16:00:00Z",
+        } == json.loads(captured.args[0])
+
+    @pytest.mark.asyncio
+    async def test_asyncio_tasks_merge_only_their_own_contextvars(
+        self, clean_contextvars
+    ):
+        """
+        With the shared processor chain, concurrently running asyncio tasks
+        merge only their own contextvars into their own JSON records.
+        """
+        logger_factory = CapturingLoggerFactory()
+        structlog.configure(
+            processors=[
+                merge_contextvars,
+                add_log_level,
+                TimeStamper(fmt="iso"),
+                JSONRenderer(),
+            ],
+            logger_factory=logger_factory,
+            wrapper_class=structlog.BoundLogger,
+        )
+
+        first_bound = asyncio.Event()
+        second_bound = asyncio.Event()
+        bind_contextvars(request_id="parent")
+
+        async def emit(task_id, bound_event, wait_event):
+            bind_contextvars(task_id=task_id)
+            bound_event.set()
+            await wait_event.wait()
+            structlog.get_logger().info(f"{task_id}-event")
+
+        await asyncio.gather(
+            emit("one", first_bound, second_bound),
+            emit("two", second_bound, first_bound),
+        )
+
+        records = [
+            json.loads(call.args[0]) for call in logger_factory.logger.calls
+        ]
+        records_by_task = {record["task_id"]: record for record in records}
+
+        assert {"one", "two"} == records_by_task.keys()
+        for task_id, record in records_by_task.items():
+            assert f"{task_id}-event" == record["event"]
+            assert "parent" == record["request_id"]
+            assert "info" == record["level"]
+            assert "timestamp" in record
 
 
 class TestUnicodeEncoder:

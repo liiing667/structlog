@@ -220,6 +220,77 @@ class TestContextvars:
         assert {"a": 1, "b": 2, "c": 3} == await coro1_task
         assert {"a": 2, "b": 2, "c": 3} == await coro2_task
 
+    async def test_parallel_binds_do_not_leak_between_tasks(self):
+        """
+        Concurrent asyncio tasks get their own copy of the context. Values
+        bound inside one task are not visible in another task, and do not
+        leak back into the parent context.
+        """
+        first_bound = asyncio.Event()
+        second_bound = asyncio.Event()
+
+        bind_contextvars(request_id="parent")
+
+        async def coro1():
+            bind_contextvars(task_id="one", shared="from-one")
+            first_bound.set()
+            await second_bound.wait()
+
+            return merge_contextvars(None, "info", {"event": "one"})
+
+        async def coro2():
+            bind_contextvars(task_id="two", shared="from-two")
+            await first_bound.wait()
+            second_bound.set()
+
+            return merge_contextvars(None, "info", {"event": "two"})
+
+        one, two = await asyncio.gather(coro1(), coro2())
+
+        assert {
+            "event": "one",
+            "request_id": "parent",
+            "task_id": "one",
+            "shared": "from-one",
+        } == one
+        assert {
+            "event": "two",
+            "request_id": "parent",
+            "task_id": "two",
+            "shared": "from-two",
+        } == two
+        assert {"request_id": "parent"} == get_contextvars()
+
+    def test_reset_after_unbind_restores_token_state(self):
+        """
+        reset_contextvars uses the tokens returned by bind_contextvars. If a
+        key is unbound after the nested bind, resetting those tokens restores
+        the value from before the nested bind and removes keys that did not
+        exist then.
+
+        This is contextvars.Token semantics, not a structlog implementation
+        defect: unbind_contextvars only marks the current value as deleted;
+        it does not mutate previously returned reset tokens.
+        """
+        bind_contextvars(a="outer", b="keep")
+        tokens = bind_contextvars(a="inner", c="temporary")
+
+        unbind_contextvars("a")
+
+        assert {
+            "event": "before-reset",
+            "b": "keep",
+            "c": "temporary",
+        } == merge_contextvars(None, "info", {"event": "before-reset"})
+
+        reset_contextvars(**tokens)
+
+        assert {
+            "event": "after-reset",
+            "b": "keep",
+            "a": "outer",
+        } == merge_contextvars(None, "info", {"event": "after-reset"})
+
     def test_get_only_gets_structlog_without_deleted(self):
         """
         get_contextvars returns only the structlog-specific key-values with
